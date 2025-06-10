@@ -1,0 +1,206 @@
+name: Windows VPS - Fixed API Issue
+on: workflow_dispatch
+
+jobs:
+  windows-vps:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    
+    steps:
+    - name: VPS Setup with Enhanced ngrok Handling
+      run: |
+        try {
+            Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+            Write-Host "=== Starting Windows VPS Setup ==="
+            
+            # Enable RDP
+            Write-Host "Enabling Remote Desktop..."
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0 -ErrorAction Stop
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -value 0
+            
+            # Create user
+            Write-Host "Creating RDP user account..."
+            $Username = "vpsuser"
+            $Password = ConvertTo-SecureString "${{ secrets.WINDOWS_USER_PASSWORD }}" -AsPlainText -Force
+            
+            if (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue) {
+                Remove-LocalUser -Name $Username -ErrorAction SilentlyContinue
+            }
+            
+            New-LocalUser -Name $Username -Password $Password -FullName "VPS User" -PasswordNeverExpires -ErrorAction Stop
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Username -ErrorAction Stop
+            Add-LocalGroupMember -Group "Administrators" -Member $Username -ErrorAction Stop
+            
+            # Start RDP services
+            Write-Host "Starting Terminal Services..."
+            Start-Service TermService -ErrorAction Stop
+            Start-Service UmRdpService -ErrorAction SilentlyContinue
+            
+            # Download ngrok v2 (more reliable in GitHub Actions)
+            Write-Host "Setting up ngrok tunnel..."
+            $ngrokUrl = "https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-windows-amd64.zip"
+            Invoke-WebRequest -Uri $ngrokUrl -OutFile "ngrok.zip" -ErrorAction Stop
+            Expand-Archive ngrok.zip -DestinationPath . -Force -ErrorAction Stop
+            
+            # Create ngrok config file for better reliability
+            $config = @"
+version: "2"
+authtoken: ${{ secrets.NGROK_AUTH_TOKEN }}
+tunnels:
+  rdp:
+    proto: tcp
+    addr: 3389
+    bind_tls: false
+"@
+            $config | Out-File -FilePath "ngrok.yml" -Encoding ASCII
+            
+            # Start ngrok with config file and capture output
+            Write-Host "Starting ngrok tunnel..."
+            $ngrokProcess = Start-Process -FilePath ".\ngrok.exe" -ArgumentList "start --all --config=ngrok.yml --log=stdout" -WindowStyle Hidden -PassThru -RedirectStandardOutput "ngrok.log"
+            
+            Write-Host "ngrok process started with PID: $($ngrokProcess.Id)"
+            
+            # Enhanced tunnel detection with multiple methods
+            $timeout = 60
+            $timer = 0
+            $tunnelEstablished = $false
+            $connectionUrl = ""
+            
+            do {
+                Start-Sleep 3
+                $timer += 3
+                
+                # Method 1: Try API
+                try {
+                    $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
+                    if ($tunnels.tunnels.Count -gt 0) {
+                        $connectionUrl = $tunnels.tunnels[0].public_url
+                        $tunnelEstablished = $true
+                        Write-Host "=== TUNNEL ESTABLISHED VIA API ==="
+                        break
+                    }
+                } catch {
+                    # Method 2: Parse log file
+                    if (Test-Path "ngrok.log") {
+                        $logContent = Get-Content "ngrok.log" -Raw
+                        if ($logContent -match "tcp://([^\s]+)" -or $logContent -match "url=tcp://([^\s]+)") {
+                            $connectionUrl = $matches[1]
+                            $tunnelEstablished = $true
+                            Write-Host "=== TUNNEL ESTABLISHED VIA LOG PARSING ==="
+                            break
+                        }
+                    }
+                    
+                    # Method 3: Check process output for ngrok v2
+                    $processes = Get-Process -Name "ngrok" -ErrorAction SilentlyContinue
+                    if ($processes) {
+                        Write-Host "Waiting for tunnel... ($timer/$timeout seconds) - ngrok is running"
+                    } else {
+                        Write-Host "Waiting for tunnel... ($timer/$timeout seconds) - checking logs"
+                        if (Test-Path "ngrok.log") {
+                            $lastLines = Get-Content "ngrok.log" -Tail 3
+                            Write-Host "Last log entries: $($lastLines -join '; ')"
+                        }
+                    }
+                }
+            } while ($timer -lt $timeout)
+            
+            if (-not $tunnelEstablished) {
+                Write-Host "=== FALLBACK: Manual tunnel detection ==="
+                # Last resort: show what we have
+                if (Test-Path "ngrok.log") {
+                    $logContent = Get-Content "ngrok.log" -Raw
+                    Write-Host "Full ngrok log:"
+                    Write-Host $logContent
+                    
+                    # Try to extract any tunnel URL from logs
+                    if ($logContent -match "tcp://[^\s]+") {
+                        $connectionUrl = $matches[0]
+                        Write-Host "Found potential connection URL in logs: $connectionUrl"
+                        $tunnelEstablished = $true
+                    }
+                }
+            }
+            
+            if ($tunnelEstablished -and $connectionUrl) {
+                Write-Host "=== CONNECTION READY ==="
+                Write-Host "RDP Connection: $connectionUrl"
+                Write-Host "Username: $Username"
+                Write-Host "Password: [Your WINDOWS_USER_PASSWORD secret]"
+                Write-Host "=== SAVE THESE DETAILS NOW ==="
+            } else {
+                Write-Host "=== TUNNEL STATUS UNKNOWN ==="
+                Write-Host "ngrok may still be starting. Check the logs above for connection details."
+                Write-Host "Username: $Username"
+                Write-Host "Password: [Your WINDOWS_USER_PASSWORD secret]"
+            }
+            
+            # Keep alive with enhanced monitoring
+            $counter = 0
+            while ($true) {
+                Start-Sleep 60
+                $counter++
+                
+                $ngrokRunning = Get-Process -Name "ngrok" -ErrorAction SilentlyContinue
+                $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+                
+                Write-Host "[$counter min] ngrok: $(if($ngrokRunning){'Running'}else{'Stopped'}) | RDP: $($rdpService.Status)"
+                
+                # Try to get current tunnel info
+                if ($counter % 2 -eq 0) {
+                    try {
+                        $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction SilentlyContinue
+                        if ($tunnels.tunnels.Count -gt 0) {
+                            Write-Host "Active tunnel: $($tunnels.tunnels[0].public_url)"
+                        }
+                    } catch {
+                        # Check logs for connection info
+                        if (Test-Path "ngrok.log") {
+                            $recentLogs = Get-Content "ngrok.log" -Tail 5
+                            $tcpMatch = $recentLogs | Select-String "tcp://" | Select-Object -Last 1
+                            if ($tcpMatch) {
+                                Write-Host "Connection from logs: $($tcpMatch.Line)"
+                            }
+                        }
+                    }
+                }
+                
+                # Restart ngrok if stopped
+                if (-not $ngrokRunning) {
+                    Write-Host "Restarting ngrok..."
+                    $ngrokProcess = Start-Process -FilePath ".\ngrok.exe" -ArgumentList "start --all --config=ngrok.yml" -WindowStyle Hidden -PassThru -RedirectStandardOutput "ngrok.log"
+                }
+            }
+        }
+        catch {
+            Write-Host "=== SETUP FAILED ==="
+            Write-Host "Error: $($_.Exception.Message)"
+            
+            # Enhanced diagnostics
+            Write-Host "=== DIAGNOSTIC INFO ==="
+            Get-Service -Name "TermService" -ErrorAction SilentlyContinue | Format-Table
+            Get-Process -Name "*ngrok*" -ErrorAction SilentlyContinue | Format-Table
+            
+            if (Test-Path "ngrok.log") {
+                Write-Host "=== NGROK LOGS ==="
+                Get-Content "ngrok.log"
+            }
+            
+            # Don't exit on tunnel timeout - keep RDP running
+            if ($_.Exception.Message -like "*tunnel*") {
+                Write-Host "=== CONTINUING WITHOUT TUNNEL CONFIRMATION ==="
+                Write-Host "RDP may still be accessible. Username: vpsuser"
+                
+                # Continue with keep-alive
+                while ($true) {
+                    Start-Sleep 60
+                    Write-Host "RDP service running, no tunnel confirmation"
+                }
+            } else {
+                exit 1
+            }
+        }
+      env:
+        NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+        WINDOWS_USER_PASSWORD: ${{ secrets.WINDOWS_USER_PASSWORD }}
